@@ -1,3 +1,4 @@
+import logging
 import tempfile
 import time
 import uuid
@@ -10,55 +11,12 @@ import gitlab
 import gitlab.base
 
 SLEEP_INTERVAL = 0.1
-TIMEOUT = 60  # seconds before timeout will occur
+TIMEOUT = 3 * 60  # seconds before timeout will occur
 
 
 @pytest.fixture(scope="session")
 def fixture_dir(test_dir):
     return test_dir / "functional" / "fixtures"
-
-
-def reset_gitlab(gl):
-    # previously tools/reset_gitlab.py
-    for project in gl.projects.list():
-        for deploy_token in project.deploytokens.list():
-            deploy_token.delete()
-        project.delete()
-    for group in gl.groups.list():
-        for deploy_token in group.deploytokens.list():
-            deploy_token.delete()
-        group.delete()
-    for variable in gl.variables.list():
-        variable.delete()
-    for user in gl.users.list():
-        if user.username != "root":
-            user.delete(hard_delete=True)
-
-    max_iterations = int(TIMEOUT / SLEEP_INTERVAL)
-
-    # Ensure everything has been reset
-    start_time = time.perf_counter()
-
-    def wait_for_maximum_list_length(
-        rest_manager: gitlab.base.RESTManager, description: str, max_length: int = 0
-    ) -> None:
-        """Wait for the list() length to be no greater than expected maximum or fail
-        test if timeout is exceeded"""
-        for _ in range(max_iterations):
-            if len(rest_manager.list()) <= max_length:
-                break
-            time.sleep(SLEEP_INTERVAL)
-        assert len(rest_manager.list()) <= max_length, (
-            f"Did not delete required items for {description}. "
-            f"Elapsed_time: {time.perf_counter() - start_time}"
-        )
-
-    wait_for_maximum_list_length(rest_manager=gl.projects, description="projects")
-    wait_for_maximum_list_length(rest_manager=gl.groups, description="groups")
-    wait_for_maximum_list_length(rest_manager=gl.variables, description="variables")
-    wait_for_maximum_list_length(
-        rest_manager=gl.users, description="users", max_length=1
-    )
 
 
 def set_token(container, fixture_dir):
@@ -163,9 +121,11 @@ def gitlab_config(check_is_alive, docker_ip, docker_services, temp_dir, fixture_
     config_file = temp_dir / "python-gitlab.cfg"
     port = docker_services.port_for("gitlab", 80)
 
+    logging.info("Waiting for GitLab container to come up...")
     docker_services.wait_until_responsive(
-        timeout=200, pause=5, check=lambda: check_is_alive("gitlab-test")
+        timeout=300, pause=5, check=lambda: check_is_alive("gitlab-test")
     )
+    logging.info("GitLab container is now up")
 
     token = set_token("gitlab-test", fixture_dir=fixture_dir)
 
@@ -188,10 +148,134 @@ api_version = 4"""
 def gl(gitlab_config):
     """Helper instance to make fixtures and asserts directly via the API."""
 
+    logging.info("Create python-gitlab gitlab.Gitlab object")
     instance = gitlab.Gitlab.from_config("local", [gitlab_config])
-    reset_gitlab(instance)
+
+    # wait for any running busy sidekiq processes to complete
+    for count in range(TIMEOUT):
+        time.sleep(SLEEP_INTERVAL)
+        busy = False
+        processes = instance.sidekiq.process_metrics()["processes"]
+        for process in processes:
+            if process["busy"]:
+                logging.info(f"sidekiq: count: {count} process_busy: {process['busy']}")
+                busy = True
+        if not busy:
+            logging.info(f"sidekiq idle check completed after {count} iterations")
+            break
+
+    if is_gitlab_ee(instance):
+        logging.info("GitLab EE detected")
+        # NOTE(jlvillal): By default in GitLab EE it will wait 7 days before
+        # deleting a group. Change it to 0 days.
+        settings = instance.settings.get()
+        if settings.deletion_adjourned_period != 0:
+            settings.deletion_adjourned_period = 0
+            settings.save()
+    # Clean up any extraneous resources which may exist
+    for project in instance.projects.list():
+        logging.info(f"Mark for deletion project: {project.name!r}")
+        for deploy_token in project.deploytokens.list():
+            logging.info(
+                f"Mark for deletion token: {deploy_token.name!r} in "
+                f"project: {project.name!r}"
+            )
+            deploy_token.delete()
+        project.delete()
+    for group in instance.groups.list():
+        logging.info(f"Mark for deletion group: {group.name!r}")
+        for deploy_token in group.deploytokens.list():
+            logging.info(
+                f"Mark for deletion token: {deploy_token.name!r} in "
+                f"group: {group.name!r}"
+            )
+            deploy_token.delete()
+        group.delete()
+    for variable in instance.variables.list():
+        logging.info(f"Mark for deletion variable: {variable.name!r}")
+        variable.delete()
+    for user in instance.users.list():
+        if user.username != "root":
+            logging.info(f"Mark for deletion user: {user.username!r}")
+            user.delete(hard_delete=True)
+
+    timeout = TIMEOUT
+    sleep_interval = 0.5
+    max_iterations = int(timeout / sleep_interval)
+
+    # Ensure everything has been reset
+    start_time = time.perf_counter()
+
+    def wait_for_maximum_list_length(
+        rest_manager: gitlab.base.RESTManager,
+        description: str,
+        max_length: int = 0,
+        should_delete_func=lambda x: True,
+    ) -> None:
+        """Wait for the list() length to be no greater than expected maximum or fail
+        test if timeout is exceeded"""
+        for count in range(max_iterations):
+            items = rest_manager.list()
+            logging.info(
+                f"Iteration: {count}: items in {description}: {[x.name for x in items]}"
+            )
+            for item in items:
+                if should_delete_func(item):
+                    logging.info(
+                        f"Marking again for deletion {description}: {item.name!r}"
+                    )
+                    try:
+                        item.delete()
+                    except gitlab.exceptions.GitlabDeleteError as exc:
+                        logging.info(
+                            f"Already marked for deletion: {item.name!r} {exc}"
+                        )
+            if len(items) <= max_length:
+                break
+            time.sleep(sleep_interval)
+        items = rest_manager.list()
+        elapsed_time = time.perf_counter() - start_time
+        if len(items) > max_length:
+            logging.error(
+                f"Too many items still remaining and timeout exceeded: {elapsed_time}"
+            )
+        assert len(items) <= max_length, (
+            f"Did not delete required items for {description}. "
+            f"Elapsed_time: {time.perf_counter() - start_time}\n"
+            f"items: {[str(x) for x in items]!r}"
+        )
+
+    wait_for_maximum_list_length(rest_manager=instance.projects, description="projects")
+    wait_for_maximum_list_length(rest_manager=instance.groups, description="groups")
+    wait_for_maximum_list_length(
+        rest_manager=instance.variables, description="variables"
+    )
+
+    def should_delete_user(user):
+        if user.username == "root":
+            return False
+        return True
+
+    wait_for_maximum_list_length(
+        rest_manager=instance.users,
+        description="users",
+        max_length=1,
+        should_delete_func=should_delete_user,
+    )
 
     return instance
+
+
+def is_gitlab_ee(gl: gitlab.Gitlab) -> bool:
+    """Determine if we are running with GitLab EE as opposed to GitLab CE"""
+    try:
+        license = gl.get_license()
+    except gitlab.exceptions.GitlabLicenseError:
+        license = None
+    # If we have a license then we assume we are running on GitLab EE
+    if license:
+        return True
+    return False
 
 
 @pytest.fixture(scope="session")

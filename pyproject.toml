@@ -87,3 +87,10 @@ disable = [
     "useless-object-inheritance",
 
 ]
+
+[tool.pytest.ini_options]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s.%(msecs)03d [%(levelname)8s] (%(filename)s:%(funcName)s:L%(lineno)s) %(message)s"
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+addopts = "--color=yes"
