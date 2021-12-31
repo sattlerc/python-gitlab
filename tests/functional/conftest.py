@@ -1,3 +1,4 @@
+import logging
 import tempfile
 import time
 import uuid
@@ -21,17 +22,29 @@ def fixture_dir(test_dir):
 def reset_gitlab(gl):
     # previously tools/reset_gitlab.py
     for project in gl.projects.list():
+        logging.info(f"Mark for deletion project: {project.name!r}")
         for deploy_token in project.deploytokens.list():
+            logging.info(
+                f"Mark for deletion token: {deploy_token.name!r} in "
+                f"project: {project.name!r}"
+            )
             deploy_token.delete()
         project.delete()
     for group in gl.groups.list():
+        logging.info(f"Mark for deletion group: {group.name!r}")
         for deploy_token in group.deploytokens.list():
+            logging.info(
+                f"Mark for deletion token: {deploy_token.name!r} in "
+                f"group: {group.name!r}"
+            )
             deploy_token.delete()
         group.delete()
     for variable in gl.variables.list():
+        logging.info(f"Mark for deletion variable: {variable.name!r}")
         variable.delete()
     for user in gl.users.list():
         if user.username != "root":
+            logging.info(f"Mark for deletion user: {user.username!r}")
             user.delete(hard_delete=True)
 
     max_iterations = int(TIMEOUT / SLEEP_INTERVAL)
@@ -44,13 +57,27 @@ def reset_gitlab(gl):
     ) -> None:
         """Wait for the list() length to be no greater than expected maximum or fail
         test if timeout is exceeded"""
-        for _ in range(max_iterations):
-            if len(rest_manager.list()) <= max_length:
+        logging.info(f"Checking {description!r} has no more than {max_length} items")
+        for count in range(max_iterations):
+            items = rest_manager.list()
+            if len(items) <= max_length:
                 break
+            logging.info(
+                f"Iteration: {count} Waiting for {description!r} items to be deleted: "
+                f"{[x.name for x in items]}"
+            )
             time.sleep(SLEEP_INTERVAL)
-        assert len(rest_manager.list()) <= max_length, (
-            f"Did not delete required items for {description}. "
-            f"Elapsed_time: {time.perf_counter() - start_time}"
+
+        items = rest_manager.list()
+        elapsed_time = time.perf_counter() - start_time
+        if len(items) > max_length:
+            logging.error(
+                f"Too many {description!r} items still remaining and timeout "
+                f"({elapsed_time}) exceeded: {[x.name for x in items]}"
+            )
+        assert len(items) <= max_length, (
+            f"Did not delete required items for {description!r}. "
+            f"Elapsed_time: {elapsed_time}"
         )
 
     wait_for_maximum_list_length(rest_manager=gl.projects, description="projects")
@@ -62,6 +89,7 @@ def reset_gitlab(gl):
 
 
 def set_token(container, fixture_dir):
+    logging.info("Creating API token.")
     set_token_rb = fixture_dir / "set_token.rb"
 
     with open(set_token_rb, "r") as f:
@@ -76,6 +104,7 @@ def set_token(container, fixture_dir):
         set_token_command,
     ]
     output = check_output(rails_command).decode().strip()
+    logging.info("Finished creating API token.")
 
     return output
 
@@ -85,7 +114,7 @@ def pytest_report_collectionfinish(config, startdir, items):
         "",
         "Starting GitLab container.",
         "Waiting for GitLab to reconfigure.",
-        "This may take a few minutes.",
+        "This will take a few minutes.",
     ]
 
 
@@ -129,6 +158,7 @@ def check_is_alive():
     """
 
     def _check(container):
+        logging.info("Checking if GitLab container is up...")
         logs = ["docker", "logs", container]
         return "gitlab Reconfigured!" in check_output(logs).decode()
 
@@ -144,7 +174,7 @@ def wait_for_sidekiq(gl):
     """
 
     def _wait(timeout=30, step=0.5):
-        for _ in range(timeout):
+        for count in range(timeout):
             time.sleep(step)
             busy = False
             processes = gl.sidekiq.process_metrics()["processes"]
@@ -153,6 +183,7 @@ def wait_for_sidekiq(gl):
                     busy = True
             if not busy:
                 return True
+            logging.info(f"sidekiq busy {count} of {timeout}")
         return False
 
     return _wait
@@ -163,9 +194,11 @@ def gitlab_config(check_is_alive, docker_ip, docker_services, temp_dir, fixture_
     config_file = temp_dir / "python-gitlab.cfg"
     port = docker_services.port_for("gitlab", 80)
 
+    logging.info("Waiting for GitLab container to become ready.")
     docker_services.wait_until_responsive(
         timeout=200, pause=5, check=lambda: check_is_alive("gitlab-test")
     )
+    logging.info("GitLab container is now ready.")
 
     token = set_token("gitlab-test", fixture_dir=fixture_dir)
 
@@ -188,7 +221,9 @@ api_version = 4"""
 def gl(gitlab_config):
     """Helper instance to make fixtures and asserts directly via the API."""
 
+    logging.info("Create python-gitlab gitlab.Gitlab object")
     instance = gitlab.Gitlab.from_config("local", [gitlab_config])
+
     reset_gitlab(instance)
 
     return instance
