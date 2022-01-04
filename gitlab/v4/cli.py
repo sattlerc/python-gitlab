@@ -39,6 +39,7 @@ class GitlabCLI(object):
         self.action = action.lower()
         self.gl = gl
         self.args = args
+        self.parent_args = {}
         self.mgr_cls: Union[
             Type[gitlab.mixins.CreateMixin],
             Type[gitlab.mixins.DeleteMixin],
@@ -53,7 +54,15 @@ class GitlabCLI(object):
         # the class _path attribute, and replace the value with the result.
         if TYPE_CHECKING:
             assert self.mgr_cls._path is not None
-        self.mgr_cls._path = self.mgr_cls._path.format(**self.args)
+        # Items in the path need to be url-encoded
+        if self.mgr_cls._from_parent_attrs:
+            for k in self.mgr_cls._from_parent_attrs:
+                if k in self.args:
+                    self.parent_args[k] = gitlab.utils.clean_str_id(self.args[k])
+                    # If we don't delete it then it will be added to the URL as a
+                    # query-string
+                    del self.args[k]
+        self.mgr_cls._path = self.mgr_cls._path.format(**self.parent_args)
         self.mgr = self.mgr_cls(gl)
 
         if self.mgr_cls._types:
@@ -85,7 +94,7 @@ class GitlabCLI(object):
             data = {}
             if self.mgr._from_parent_attrs:
                 for k in self.mgr._from_parent_attrs:
-                    data[k] = self.args[k]
+                    data[k] = self.parent_args[k]
             if not issubclass(self.cls, gitlab.mixins.GetWithoutIdMixin):
                 if TYPE_CHECKING:
                     assert isinstance(self.cls._id_attr, str)

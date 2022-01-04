@@ -17,3 +17,10 @@ def test_list_project_variables(gitlab_cli, project):
     ret = gitlab_cli(cmd)
 
     assert ret.success
+
+
+def test_list_project_variables_with_path(gitlab_cli, project):
+    cmd = ["project-variable", "list", "--project-id", project.path_with_namespace]
+    ret = gitlab_cli(cmd)
+
+    assert ret.success
